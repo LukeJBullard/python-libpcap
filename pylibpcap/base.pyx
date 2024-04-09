@@ -5,7 +5,7 @@
 # @Last Modified time: 2021-01-28 22:19:29
 import os
 import time
-from threading import Thread
+from threading import Thread, BoundedSemaphore, Event
 
 from pylibpcap.utils import to_c_str, from_c_str, get_pcap_file
 from pylibpcap.exception import LibpcapError
@@ -24,7 +24,6 @@ DEF PCAP_ERROR_BREAK = -2
 DEF PCAP_ERROR_NOT_ACTIVATED = -3
 DEF PCAP_ERROR_ACTIVATED = -4
 DEF PCAP_ERROR_NO_SUCH_DEVICE = -5
-
 
 cdef class BasePcap(object):
     """BasePcap
@@ -247,10 +246,17 @@ cdef class Sniff(BasePcap):
     :param out_file: Output pcap file, default ``""``
     """
 
-    cdef object nonblocking_thread
+    cdef int threaded
+    cdef object thread
+    cdef object done_capturing
+    cdef object capturing_threaded_requested
+    cdef bint capturing_threaded
+    cdef int promisc
+    cdef int timeout
+    cdef int immediate
 
     def __init__(self, str iface, int count=-1, int promisc=0, int snaplen=65535,
-                 int timeout=0, str filters="", str out_file="", int monitor=-1, *args, **kwargs):
+                 int timeout=0, immediate=0, str filters="", str out_file="", int monitor=-1, int threaded=0, *args, **kwargs):
         """init
         """
 
@@ -260,14 +266,25 @@ cdef class Sniff(BasePcap):
         self.count = count
         self.handler = pcap_create(self.iface, self.errbuf)
         self.capture_cnt = 0
-        self.nonblocking_thread = 0
+        self.threaded = threaded
+
+        #threading events for waiting/interthread comm
+        if self.threaded:
+            self.done_capturing = Event()
+            self.capturing_threaded_requested = Event()
+        self.capturing_threaded = False
+
+        self.snaplen=snaplen
+        self.promisc=promisc
+        self.timeout=timeout
+        self.immediate=immediate
 
         # self.handler = pcap_open_live(self.iface, snaplen, promisc, 0, self.errbuf)
 
-        pcap_set_snaplen(self.handler, snaplen)
-        pcap_set_promisc(self.handler, promisc)
-        pcap_set_timeout(self.handler, timeout)
-        pcap_set_immediate_mode(self.handler, 1)
+        pcap_set_snaplen(self.handler, self.snaplen)
+        pcap_set_promisc(self.handler, self.promisc)
+        pcap_set_timeout(self.handler, self.timeout)
+        pcap_set_immediate_mode(self.handler, self.immediate)
 
         #check and set monitor mode if available
         if monitor > 0:
@@ -300,44 +317,95 @@ cdef class Sniff(BasePcap):
 
         self.out_pcap = pcap_dump_open(self.handler, self.out_file) if out_file else NULL
 
+        if self.threaded:
+            self.thread = Thread(target = self.capture_thread)
+            self.thread.start()
+
+    def set_outpcap(self, out_filename):
+        """Open a new output pcap file at filename
+        """
+        self.out_pcap = pcap_dump_open(<pcap_t *>self.handler, os.path.expanduser(self._to_c_str(out_filename)))
+
+    def close_outpcap(self):
+        """Close the currently open outpcap file, and flush
+        """
+        if not self.out_pcap:
+            return
+        pcap_dump_flush(<pcap_dumper_t *>self.out_pcap)
+        pcap_dump_close(<pcap_dumper_t *>self.out_pcap)
+        self.out_pcap = NULL
+
     def get_handler_error(self):
         """handler error
         """
 
         return self._from_c_str(pcap_geterr(self.handler))
+
+    def is_capturing_threaded(self):
+        """Returns if threaded mode is enabled and is currently capturing
+        """
+        return self.threaded and self.capturing_threaded
     
-    def capture_nonblocking_thread(self):
-        """Code that runs in the thread
+    def capture_thread(self):
+        """The code that runs in the thread when threaded mode is on
         """
+        if not self.threaded:
+            raise Exception("Not initialized as running in threaded mode")
+            return
+        
+        while True:
+            self.capturing_threaded_requested.wait()
+            self.capturing_threaded_requested.clear()
+            self.done_capturing.clear()
+            self.capturing_threaded = True
 
-        captured_packets = pcap_loop(self.handler, self.count, sniff_callback, <u_char*>self.out_pcap)
-        if captured_packets != PCAP_ERROR_BREAK and captured_packets > 0:
-            self.capture_cnt += captured_packets
-        self.nonblocking_thread = 0
+            pcap_loop(self.handler, self.count, sniff_callback, <u_char *>self.out_pcap)
+            
+            self.capturing_threaded = False
+            self.done_capturing.set()
 
-    def capture_nonblocking(self):
-        """Start capturing packets in another thread
+    def wait_for_thread(self, timeout=0):
+        """Wait for the capture thread to break out of the loop
+           This should be called after stop_capture_threaded
+
+           If a timeout is set, block that long then return either way
+
+           Returns-True if the capture is marked as ended, False if the timeout occurred before the capture finished
         """
+        if not self.threaded:
+            raise Exception("Not initialized as running in threaded mode")
+            return True
 
-        if not self.nonblocking_thread:
-            self.nonblocking_thread = Thread(target = self.capture_nonblocking_thread)
-            self.nonblocking_thread.start()
-
-    def is_running_nonblocking(self):
-        """Return whether there is a nonblocking capture thread is_running_nonblocking
-        """
-        return self.nonblocking_thread and self.nonblocking_thread.is_alive()
+        if timeout:
+            finished=self.done_capturing.wait(timeout)
+        else:
+            finished=self.done_capturing.wait()
+        
+        if finished:
+            self.done_capturing.clear()
+        
+        return finished
 
     
-    def stop_capture_nonblocking(self):
-        """Stop capturing packets in another thread (capture_nonblocking)
+    def run_capture_threaded(self):
+        """Directs the capture thread to begin a capture
         """
+        if not self.threaded:
+            raise Exception("Not initialized as running in threaded mode")
+            return
+        
+        self.capturing_threaded_requested.set()
+    
+    def stop_capture_threaded(self):
+        """Directs the capture thread to break a running capture
+        """
+        if not self.threaded:
+            raise Exception("Not initialized as running in threaded mode")
+            return
 
-        if self.nonblocking_thread:
-            pcap_breakloop(self.handler)
-            self.nonblocking_thread.join()
-            self.nonblocking_thread = 0
-
+        self.capturing_threaded_requested.clear()
+        pcap_breakloop(self.handler)
+    
     def capture(self):
         """Run capture packet
         """
@@ -377,10 +445,7 @@ cdef class Sniff(BasePcap):
         close
         """
 
-        if self.out_pcap != NULL:
-            pcap_dump_flush(self.out_pcap)
-            pcap_dump_close(self.out_pcap)
-            self.out_pcap = NULL
+        self.close_outpcap()
 
         if self.handler != NULL:
             pcap_close(self.handler)
