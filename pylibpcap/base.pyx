@@ -5,7 +5,8 @@
 # @Last Modified time: 2021-01-28 22:19:29
 import os
 import time
-from threading import Thread, BoundedSemaphore, Event
+from threading import BoundedSemaphore, Event
+from pylibpcap.KillableThread import KillableThread
 
 from pylibpcap.utils import to_c_str, from_c_str, get_pcap_file
 from pylibpcap.exception import LibpcapError
@@ -318,7 +319,7 @@ cdef class Sniff(BasePcap):
         self.out_pcap = pcap_dump_open(self.handler, self.out_file) if out_file else NULL
 
         if self.threaded:
-            self.thread = Thread(target = self.capture_thread)
+            self.thread = KillableThread(target = self.capture_thread)
             self.thread.start()
 
     def set_outpcap(self, out_filename):
@@ -353,16 +354,20 @@ cdef class Sniff(BasePcap):
             raise Exception("Not initialized as running in threaded mode")
             return
         
-        while True:
-            self.capturing_threaded_requested.wait()
-            self.capturing_threaded_requested.clear()
-            self.done_capturing.clear()
-            self.capturing_threaded = True
+        try:
+            while True:
+                self.capturing_threaded_requested.wait()
+                self.capturing_threaded_requested.clear()
+                self.done_capturing.clear()
+                self.capturing_threaded = True
 
-            pcap_loop(self.handler, self.count, sniff_callback, <u_char *>self.out_pcap)
-            
-            self.capturing_threaded = False
-            self.done_capturing.set()
+                pcap_loop(self.handler, self.count, sniff_callback, <u_char *>self.out_pcap)
+                
+                self.capturing_threaded = False
+                self.done_capturing.set()
+
+        finally:
+            pass
 
     def wait_for_thread(self, timeout=0):
         """Wait for the capture thread to break out of the loop
@@ -404,7 +409,9 @@ cdef class Sniff(BasePcap):
             return
 
         self.capturing_threaded_requested.clear()
-        pcap_breakloop(self.handler)
+        
+        if self.is_capturing_threaded():
+            pcap_breakloop(self.handler)
     
     def capture(self):
         """Run capture packet
@@ -448,6 +455,11 @@ cdef class Sniff(BasePcap):
         self.close_outpcap()
 
         if self.handler != NULL:
+            if self.is_capturing_threaded():
+                self.stop_capture_threaded()
+                if not self.wait_for_thread(timeout=2):
+                    self.thread.raise_exception()
+
             pcap_close(self.handler)
             self.handler = NULL
 
